@@ -1,4 +1,4 @@
-crewai[tools]>=1.9.0
+crewai[tools,google-genai]>=1.9.0
 crewai-tools>=1.9.0
 litellm>=1.75.0,<1.76.0
 fastapi>=0.115.0
