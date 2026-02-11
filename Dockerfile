@@ -5,7 +5,7 @@ WORKDIR /app
 RUN apt-get update && apt-get install -y --no-install-recommends git && \
     rm -rf /var/lib/apt/lists/*
 
-RUN useradd -r -s /bin/false vulnhawk
+RUN useradd -r -m -s /bin/false vulnhawk
 
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
