@@ -5,12 +5,15 @@ WORKDIR /app
 RUN apt-get update && apt-get install -y --no-install-recommends git && \
     rm -rf /var/lib/apt/lists/*
 
-RUN useradd -r -m -s /bin/false vulnhawk
+RUN useradd -r -m -s /bin/false vulnhawk && \
+    mkdir -p /home/vulnhawk/.local/share/crewai && \
+    chown -R vulnhawk:vulnhawk /home/vulnhawk
 
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
 COPY app/ .
+RUN chown -R vulnhawk:vulnhawk /app
 
 USER vulnhawk
 EXPOSE 8000
