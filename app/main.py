@@ -130,7 +130,7 @@ def _extract_table_dependencies(report_text: str) -> dict[str, set[str]]:
         cols = [c.strip() for c in line.strip().strip("|").split("|")]
         if not cols:
             continue
-        dep = cols[0].strip("` ").strip()
+        dep = cols[0].strip("` *_").strip()
         if not dep or dep.lower() in ("dependency", "none", "n/a", "-"):
             continue
         deps.add(dep)
@@ -141,12 +141,12 @@ def _extract_table_dependencies(report_text: str) -> dict[str, set[str]]:
             vuln_ids[current_section] = set()
         if current_section == "upgrade plan":
             if len(cols) >= 2:
-                upgrade = cols[1].strip("` ").strip()
+                upgrade = cols[1].strip("` *_").strip()
                 if upgrade and upgrade.lower() != "upgrade":
                     upgrades.add(upgrade)
         if current_section in ("critical & high vulnerabilities", "medium & low vulnerabilities"):
             if len(cols) >= 2:
-                vuln_id = cols[1].strip("` ").strip()
+                vuln_id = cols[1].strip("` *_").strip()
                 if vuln_id and vuln_id.lower() != "vuln id":
                     vuln_ids[current_section].add(vuln_id)
     return {"dependencies": deps, "upgrades": upgrades, "sections": sections, "vuln_ids": vuln_ids}
