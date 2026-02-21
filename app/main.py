@@ -6,7 +6,9 @@ Run:
     uvicorn main:app --host 0.0.0.0 --port 8000
 """
 
+import asyncio
 import os
+import pathlib
 import re
 import json
 import shutil
@@ -16,6 +18,8 @@ import httpx
 from datetime import datetime
 from dotenv import load_dotenv
 from fastapi import FastAPI, HTTPException
+from fastapi.responses import FileResponse
+from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 from crewai import Crew, Process, Task
 
@@ -29,6 +33,14 @@ app = FastAPI(
     description="AI-powered vulnerability scanner using CrewAI",
     version="1.0.0",
 )
+
+_STATIC = pathlib.Path(__file__).parent / "static"
+if _STATIC.is_dir():
+    app.mount("/static", StaticFiles(directory=str(_STATIC)), name="static")
+
+    @app.get("/", response_class=FileResponse, include_in_schema=False)
+    async def ui():
+        return FileResponse(str(_STATIC / "index.html"))
 
 
 class ScanRequest(BaseModel):
@@ -458,53 +470,33 @@ def create_tasks(repo_scanner, vuln_analyst, upgrade_strategist, report_generato
     return [scan_task, vuln_task, upgrade_task, report_task]
 
 
-@app.post("/scan", response_model=ScanResponse)
-async def scan(payload: ScanRequest):
-    """Run a vulnerability scan on a GitHub URL or dependency list."""
-    has_input = payload.input and payload.input.strip()
-    has_url = payload.github_url and payload.github_url.strip()
+def _run_full_scan(scan_path: str) -> str:
+    """Synchronous full-repo scan — runs in a thread via asyncio.to_thread."""
+    repo_scanner, vuln_analyst, upgrade_strategist, report_generator = create_agents()
+    tasks = create_tasks(
+        repo_scanner, vuln_analyst, upgrade_strategist, report_generator,
+        scan_path,
+    )
+    crew = Crew(
+        agents=[repo_scanner, vuln_analyst, upgrade_strategist, report_generator],
+        tasks=tasks,
+        process=Process.sequential,
+        verbose=True,
+    )
+    result = crew.kickoff()
+    report_text = clean_report(str(result))
+    expected_build_system, expected_allowlist, expected_vuln_ids = _compute_vuln_expectations(scan_path)
+    validate_report_dependencies(
+        report_text,
+        expected_build_system,
+        expected_allowlist,
+        expected_vuln_ids,
+    )
+    return report_text
 
-    if not has_input and not has_url:
-        raise HTTPException(
-            status_code=400,
-            detail="Provide 'github_url' (full repo scan) or 'input' (dependency coordinates).",
-        )
 
-    tmp_dir = None
-
-    if has_url:
-        scan_path, tmp_dir = resolve_repo_path(payload.github_url)
-        # Full repo scan
-        try:
-            repo_scanner, vuln_analyst, upgrade_strategist, report_generator = create_agents()
-            tasks = create_tasks(
-                repo_scanner, vuln_analyst, upgrade_strategist, report_generator,
-                scan_path,
-            )
-            crew = Crew(
-                agents=[repo_scanner, vuln_analyst, upgrade_strategist, report_generator],
-                tasks=tasks,
-                process=Process.sequential,
-                verbose=True,
-            )
-            result = crew.kickoff()
-            report_text = clean_report(str(result))
-            try:
-                expected_build_system, expected_allowlist, expected_vuln_ids = _compute_vuln_expectations(scan_path)
-                validate_report_dependencies(
-                    report_text,
-                    expected_build_system,
-                    expected_allowlist,
-                    expected_vuln_ids,
-                )
-            except ValueError as e:
-                raise HTTPException(status_code=400, detail=str(e))
-            return ScanResponse(result=report_text)
-        finally:
-            if tmp_dir:
-                shutil.rmtree(tmp_dir, ignore_errors=True)
-
-    # Quick dependency list scan
+def _run_dep_scan(dep_input: str) -> str:
+    """Synchronous dependency-list scan — runs in a thread via asyncio.to_thread."""
     from crewai import Agent
 
     llm = get_llm()
@@ -516,7 +508,6 @@ async def scan(payload: ScanRequest):
         llm=llm,
         verbose=True,
     )
-
     vuln_agent = Agent(
         role="Vulnerability Hunter",
         goal="Find known CVEs and security issues in dependencies",
@@ -525,7 +516,6 @@ async def scan(payload: ScanRequest):
         llm=llm,
         verbose=True,
     )
-
     report_agent = Agent(
         role="Security Report Analyst",
         goal="Compile a clear vulnerability report with severity ratings",
@@ -535,17 +525,15 @@ async def scan(payload: ScanRequest):
     )
 
     recon_task = Task(
-        description=f"Parse this dependency list into JSON with group_id, artifact_id, version:\n\n{payload.input}",
+        description=f"Parse this dependency list into JSON with group_id, artifact_id, version:\n\n{dep_input}",
         expected_output="A JSON array of packages with group_id, artifact_id, and version.",
         agent=recon_agent,
     )
-
     vuln_task = Task(
         description="Use the 'Check OSV Vulnerabilities' tool with the JSON array from the previous step.",
         expected_output="Raw CVE findings for each dependency.",
         agent=vuln_agent,
     )
-
     report_task = Task(
         description="Compile findings into a report with severity, CVE ID, description, and fix.",
         expected_output="A structured vulnerability report with severity ratings and remediation steps.",
@@ -558,9 +546,35 @@ async def scan(payload: ScanRequest):
         process=Process.sequential,
         verbose=True,
     )
+    return str(crew.kickoff())
 
-    result = crew.kickoff()
-    return ScanResponse(result=str(result))
+
+@app.post("/scan", response_model=ScanResponse)
+async def scan(payload: ScanRequest):
+    """Run a vulnerability scan on a GitHub URL or dependency list."""
+    has_input = payload.input and payload.input.strip()
+    has_url = payload.github_url and payload.github_url.strip()
+
+    if not has_input and not has_url:
+        raise HTTPException(
+            status_code=400,
+            detail="Provide 'github_url' (full repo scan) or 'input' (dependency coordinates).",
+        )
+
+    if has_url:
+        scan_path, tmp_dir = resolve_repo_path(payload.github_url)
+        try:
+            try:
+                report_text = await asyncio.to_thread(_run_full_scan, scan_path)
+            except ValueError as e:
+                raise HTTPException(status_code=400, detail=str(e))
+            return ScanResponse(result=report_text)
+        finally:
+            if tmp_dir:
+                shutil.rmtree(tmp_dir, ignore_errors=True)
+
+    result = await asyncio.to_thread(_run_dep_scan, payload.input)
+    return ScanResponse(result=result)
 
 
 @app.get("/health")

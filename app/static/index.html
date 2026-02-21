@@ -1,0 +1,150 @@
+<!DOCTYPE html>
+<html lang="en" class="dark">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>VulnHawk — AI Vulnerability Scanner</title>
+  <script src="https://cdn.tailwindcss.com"></script>
+  <script src="https://cdn.jsdelivr.net/npm/marked/marked.min.js"></script>
+  <script>
+    tailwind.config = {
+      darkMode: 'class',
+      theme: {
+        extend: {
+          colors: {
+            brand: { 50:'#fff1f2',100:'#ffe4e6',500:'#ef4444',600:'#dc2626',700:'#b91c1c',900:'#7f1d1d' },
+            surface: { 800:'#1e1e2e', 700:'#2a2a3c', 600:'#353548' },
+          }
+        }
+      }
+    }
+  </script>
+  <style>
+    body { background: #121220; font-family: 'Inter', system-ui, sans-serif; }
+    .glass { background: rgba(30,30,46,0.8); backdrop-filter: blur(12px); border: 1px solid rgba(255,255,255,0.06); }
+    .pulse-dot { animation: pulse-ring 2s ease-out infinite; }
+    @keyframes pulse-ring { 0% { box-shadow: 0 0 0 0 rgba(34,197,94,0.5); } 70% { box-shadow: 0 0 0 8px rgba(34,197,94,0); } }
+    .spinner { border: 3px solid rgba(255,255,255,0.1); border-top-color: #ef4444; border-radius: 50%; width: 20px; height: 20px; animation: spin .7s linear infinite; display: inline-block; }
+    .spinner-lg { border: 4px solid rgba(255,255,255,0.1); border-top-color: #ef4444; border-radius: 50%; width: 40px; height: 40px; animation: spin .8s linear infinite; display: inline-block; }
+    @keyframes spin { to { transform: rotate(360deg); } }
+    .fade-in { animation: fadeIn .3s ease-out; }
+    @keyframes fadeIn { from { opacity: 0; transform: translateY(8px); } to { opacity: 1; transform: none; } }
+    .ai-content h1 { color: #fca5a5; margin-top: 1.2em; margin-bottom: .5em; font-weight: 700; font-size: 1.2rem; }
+    .ai-content h2 { color: #fca5a5; margin-top: 1em; margin-bottom: .4em; font-weight: 600; font-size: 1.05rem; }
+    .ai-content h3 { color: #fcd34d; margin-top: .8em; margin-bottom: .3em; font-weight: 600; font-size: .95rem; }
+    .ai-content p { margin-bottom: .6em; color: #d1d5db; }
+    .ai-content ul, .ai-content ol { margin-left: 1.4em; margin-bottom: .6em; }
+    .ai-content li { margin-bottom: .25em; color: #d1d5db; }
+    .ai-content strong { color: #f9fafb; }
+    .ai-content table { width: 100%; border-collapse: collapse; margin-bottom: 1em; font-size: .82rem; }
+    .ai-content th { background: rgba(239,68,68,0.12); color: #fca5a5; padding: 6px 10px; text-align: left; border-bottom: 1px solid rgba(239,68,68,0.2); }
+    .ai-content td { padding: 5px 10px; border-bottom: 1px solid rgba(255,255,255,0.05); color: #d1d5db; }
+    .ai-content tr:hover td { background: rgba(255,255,255,0.03); }
+    .ai-content code { background: rgba(255,255,255,0.07); padding: 1px 5px; border-radius: 4px; font-size: .85em; color: #fcd34d; }
+    .ai-content pre { background: rgba(0,0,0,0.3); padding: 12px; border-radius: 8px; overflow-x: auto; margin-bottom: .8em; }
+    .ai-content pre code { background: none; padding: 0; color: #e5e7eb; }
+    .badge { font-size: .65rem; padding: 2px 8px; border-radius: 9999px; font-weight: 600; text-transform: uppercase; letter-spacing: .05em; }
+    .badge-red { background: rgba(239,68,68,.15); color: #f87171; }
+    .badge-orange { background: rgba(249,115,22,.15); color: #fb923c; }
+    .badge-yellow { background: rgba(234,179,8,.15); color: #facc15; }
+    .badge-green { background: rgba(34,197,94,.15); color: #4ade80; }
+    .badge-blue { background: rgba(59,130,246,.15); color: #60a5fa; }
+    .scan-mode-btn { transition: all .15s; }
+    .scan-mode-btn.active { background: rgba(239,68,68,0.15); border-color: rgba(239,68,68,0.4); color: #fca5a5; }
+    textarea, input[type="text"] { background: #2a2a3c; border: 1px solid rgba(255,255,255,0.08); }
+    textarea:focus, input:focus { outline: none; border-color: #ef4444; box-shadow: 0 0 0 2px rgba(239,68,68,0.15); }
+  </style>
+</head>
+<body class="text-gray-300 min-h-screen">
+
+  <!-- ── Header ──────────────────────────────────────────────── -->
+  <header class="glass sticky top-0 z-50 px-6 py-3 flex items-center justify-between">
+    <div class="flex items-center gap-3">
+      <div class="w-9 h-9 rounded-lg bg-brand-600 flex items-center justify-center text-white font-bold text-lg select-none">V</div>
+      <div>
+        <h1 class="text-white font-bold text-lg leading-tight">VulnHawk</h1>
+        <p class="text-xs text-gray-500">AI Vulnerability Scanner</p>
+      </div>
+    </div>
+    <div id="health-badge" class="flex items-center gap-2 text-sm text-gray-400">
+      <span class="spinner" style="width:14px;height:14px;border-width:2px"></span> Connecting...
+    </div>
+  </header>
+
+  <!-- ── Main ───────────────────────────────────────────────── -->
+  <main class="max-w-5xl mx-auto px-4 py-6 space-y-5">
+
+    <!-- Scan Card -->
+    <div class="glass rounded-xl p-5 space-y-4">
+      <div class="flex items-center justify-between">
+        <h2 class="text-white font-semibold">Scan Repository</h2>
+        <!-- Mode toggle -->
+        <div class="flex gap-1 p-1 bg-surface-700 rounded-lg">
+          <button id="mode-url" onclick="setMode('url')"
+                  class="scan-mode-btn active px-3 py-1.5 rounded-md text-xs font-medium border border-transparent text-gray-300">
+            GitHub URL
+          </button>
+          <button id="mode-dep" onclick="setMode('dep')"
+                  class="scan-mode-btn px-3 py-1.5 rounded-md text-xs font-medium border border-transparent text-gray-400">
+            Dependency List
+          </button>
+        </div>
+      </div>
+
+      <!-- URL input -->
+      <div id="input-url" class="flex gap-3">
+        <input id="github-url" type="text"
+               placeholder="https://github.com/owner/repo"
+               class="flex-1 rounded-lg px-4 py-2.5 text-white placeholder-gray-600 text-sm" />
+      </div>
+
+      <!-- Dep textarea -->
+      <div id="input-dep" class="hidden">
+        <textarea id="dep-list" rows="5"
+                  placeholder="Paste Maven/Gradle coordinates, one per line:&#10;com.fasterxml.jackson.core:jackson-databind:2.13.0&#10;org.apache.logging.log4j:log4j-core:2.14.1"
+                  class="w-full rounded-lg px-4 py-3 text-white placeholder-gray-600 text-sm resize-none font-mono"></textarea>
+      </div>
+
+      <div class="flex items-center gap-3">
+        <button onclick="runScan()" id="scan-btn"
+                class="px-6 py-2.5 bg-brand-600 hover:bg-brand-700 rounded-lg text-sm text-white font-medium transition disabled:opacity-50 disabled:cursor-not-allowed">
+          Run Scan
+        </button>
+        <span id="scan-hint" class="text-xs text-gray-600">Full repo scans take 5–15 minutes</span>
+      </div>
+    </div>
+
+    <!-- Loading State -->
+    <div id="scan-loading" class="hidden glass rounded-xl p-10 text-center fade-in">
+      <div class="spinner-lg mx-auto mb-4"></div>
+      <p class="text-white font-medium mb-1">Scanning for vulnerabilities…</p>
+      <p class="text-gray-500 text-sm" id="loading-sub">Agents are analyzing your repository. This can take 5–15 minutes.</p>
+      <div id="elapsed-timer" class="text-gray-600 text-xs mt-3 font-mono"></div>
+    </div>
+
+    <!-- Result -->
+    <div id="result-card" class="hidden glass rounded-xl fade-in">
+      <!-- Summary bar -->
+      <div id="summary-bar" class="flex items-center gap-4 px-5 pt-5 pb-3 border-b border-white/5 flex-wrap gap-y-2"></div>
+      <!-- Report body -->
+      <div class="p-5">
+        <div class="flex items-center justify-between mb-4">
+          <h2 class="text-white font-semibold">Vulnerability Report</h2>
+          <button onclick="copyReport()" class="px-3 py-1.5 bg-surface-600 hover:bg-surface-700 rounded-lg text-xs text-gray-300 transition">
+            Copy Report
+          </button>
+        </div>
+        <div id="report-body" class="ai-content text-sm leading-relaxed"></div>
+      </div>
+    </div>
+
+  </main>
+
+  <!-- ── Footer ─────────────────────────────────────────────── -->
+  <footer class="text-center text-xs text-gray-700 py-6 px-4">
+    VulnHawk — for authorized security assessment use only. Powered by CrewAI + OSV.
+  </footer>
+
+  <script src="/static/app.js"></script>
+</body>
+</html>
