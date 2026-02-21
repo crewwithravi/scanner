@@ -131,7 +131,7 @@ def _extract_table_dependencies(report_text: str) -> dict[str, set[str]]:
         if not cols:
             continue
         dep = cols[0].strip("` ").strip()
-        if not dep or dep.lower() == "dependency":
+        if not dep or dep.lower() in ("dependency", "none", "n/a", "-"):
             continue
         deps.add(dep)
         if current_section not in sections:
@@ -509,9 +509,9 @@ def _expand_maven_deps(coords: list[dict]) -> list[dict]:
         <dependencyManagement> (including BOM imports)
       - Use the merged dep-management map to resolve unversioned deps
       - Deduplicate by group:artifact (first/nearest version wins, like Maven)
-      - Cap at MAX_DEPS to avoid runaway resolution on huge trees
+      - Deduplication by group:artifact prevents infinite loops naturally
     """
-    MAX_DEPS = 350
+    MAX_DEPS = 10_000  # effectively unlimited; real trees top out ~500 deps
     SKIP_SCOPES = {"test", "provided", "system"}
     pom_cache: dict[str, dict] = {}  # "g:a:v" -> parsed data, shared across calls
 

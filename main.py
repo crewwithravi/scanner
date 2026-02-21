@@ -100,7 +100,7 @@ def _extract_table_dependencies(report_text: str) -> dict[str, set[str]]:
         if not cols:
             continue
         dep = cols[0].strip("` ").strip()
-        if not dep or dep.lower() == "dependency":
+        if not dep or dep.lower() in ("dependency", "none", "n/a", "-"):
             continue
         deps.add(dep)
         if current_section not in sections:
