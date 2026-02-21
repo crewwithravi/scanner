@@ -2,11 +2,22 @@ FROM python:3.11-slim
 
 WORKDIR /app
 
-RUN apt-get update && apt-get install -y --no-install-recommends git && \
-    rm -rf /var/lib/apt/lists/*
+# git        — for cloning repos
+# Java 17    — to run ./gradlew and mvn dependency:list (transitive dep resolution)
+# Maven      — for Maven projects without a wrapper
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        git \
+        default-jdk-headless \
+        maven \
+    && rm -rf /var/lib/apt/lists/*
+
+# Gradle wrapper downloads Gradle on first use — point its cache to a writable dir
+ENV GRADLE_USER_HOME=/home/vulnhawk/.gradle
 
 RUN useradd -r -m -s /bin/false vulnhawk && \
-    mkdir -p /home/vulnhawk/.local/share/crewai && \
+    mkdir -p /home/vulnhawk/.local/share/crewai \
+             /home/vulnhawk/.gradle \
+             /home/vulnhawk/.m2 && \
     chown -R vulnhawk:vulnhawk /home/vulnhawk
 
 COPY requirements.txt .
