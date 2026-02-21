@@ -13,6 +13,7 @@ import re
 import json
 import shutil
 import subprocess
+import xml.etree.ElementTree as ET
 import tempfile
 import httpx
 from datetime import datetime
@@ -498,6 +499,151 @@ def _run_full_scan(scan_path: str) -> str:
     return report_text
 
 
+def _expand_maven_deps(coords: list[dict]) -> list[dict]:
+    """Fully resolve all transitive Maven dependencies via recursive POM fetching.
+
+    Algorithm:
+      - BFS over the dependency graph
+      - For each artifact, fetch its POM from Maven Central
+      - Walk the parent POM chain to collect inherited <properties> and
+        <dependencyManagement> (including BOM imports)
+      - Use the merged dep-management map to resolve unversioned deps
+      - Deduplicate by group:artifact (first/nearest version wins, like Maven)
+      - Cap at MAX_DEPS to avoid runaway resolution on huge trees
+    """
+    MAX_DEPS = 350
+    SKIP_SCOPES = {"test", "provided", "system"}
+    pom_cache: dict[str, dict] = {}  # "g:a:v" -> parsed data, shared across calls
+
+    def pom_url(g: str, a: str, v: str) -> str:
+        return f"https://repo1.maven.org/maven2/{g.replace('.', '/')}/{a}/{v}/{a}-{v}.pom"
+
+    def fetch_pom(g: str, a: str, v: str) -> dict:
+        """Fetch + parse one POM. Returns {props, dep_mgmt, direct} or {}."""
+        key = f"{g}:{a}:{v}"
+        if key in pom_cache:
+            return pom_cache[key]
+        pom_cache[key] = {}  # mark in-progress to break cycles
+
+        try:
+            resp = httpx.get(pom_url(g, a, v), timeout=15, follow_redirects=True)
+            if resp.status_code != 200:
+                return {}
+            root = ET.fromstring(resp.text)
+        except Exception:
+            return {}
+
+        m = re.match(r"\{(.+?)\}", root.tag)
+        ns = f"{{{m.group(1)}}}" if m else ""
+
+        def txt(elem, tag: str, default: str = "") -> str:
+            return (elem.findtext(f"{ns}{tag}", default) or default).strip()
+
+        # ── 1. Resolve parent chain first ────────────────────────────────────
+        parent_props: dict[str, str] = {}
+        parent_dep_mgmt: dict[str, str] = {}
+        parent_elem = root.find(f"{ns}parent")
+        if parent_elem is not None:
+            pg = txt(parent_elem, "groupId")
+            pa = txt(parent_elem, "artifactId")
+            pv = txt(parent_elem, "version")
+            if pg and pa and pv and not pv.startswith("${"):
+                pd = fetch_pom(pg, pa, pv)
+                parent_props = pd.get("props", {})
+                parent_dep_mgmt = pd.get("dep_mgmt", {})
+
+        # ── 2. Collect local <properties> (override parent) ──────────────────
+        props: dict[str, str] = {
+            "project.version": v,
+            "project.groupId": g,
+            "project.artifactId": a,
+            **parent_props,
+        }
+        props_elem = root.find(f"{ns}properties")
+        if props_elem is not None:
+            for p in props_elem:
+                props[p.tag.replace(ns, "")] = (p.text or "").strip()
+
+        def resolve(val: str) -> str:
+            """Resolve ${property} references, up to 3 hops."""
+            for _ in range(3):
+                if not val.startswith("${"):
+                    break
+                val = props.get(val[2:-1], val)
+            return val
+
+        # ── 3. Build <dependencyManagement> map (parent + BOM imports + local) ─
+        dep_mgmt: dict[str, str] = dict(parent_dep_mgmt)
+        dm_elem = root.find(f"{ns}dependencyManagement/{ns}dependencies")
+        if dm_elem is not None:
+            for d in dm_elem.findall(f"{ns}dependency"):
+                dg  = resolve(txt(d, "groupId"))
+                da  = resolve(txt(d, "artifactId"))
+                dv  = resolve(txt(d, "version"))
+                ds  = txt(d, "scope", "compile")
+                if ds == "import" and dg and da and dv and not dv.startswith("${"):
+                    # BOM import — merge its dep_mgmt into ours
+                    bom = fetch_pom(dg, da, dv)
+                    for k, bv in bom.get("dep_mgmt", {}).items():
+                        dep_mgmt.setdefault(k, bv)
+                elif dg and da and dv and not dv.startswith("${"):
+                    dep_mgmt[f"{dg}:{da}"] = dv
+
+        # ── 4. Collect direct <dependencies> ─────────────────────────────────
+        direct: list[dict] = []
+        deps_elem = root.find(f"{ns}dependencies")
+        if deps_elem is not None:
+            for d in deps_elem.findall(f"{ns}dependency"):
+                dg  = resolve(txt(d, "groupId"))
+                da  = resolve(txt(d, "artifactId"))
+                dv  = resolve(txt(d, "version"))
+                ds  = txt(d, "scope", "compile")
+                opt = txt(d, "optional", "false").lower()
+
+                if ds in SKIP_SCOPES or opt == "true":
+                    continue
+
+                # Version may be managed (not declared inline)
+                if not dv or dv.startswith("${"):
+                    dv = dep_mgmt.get(f"{dg}:{da}", "")
+
+                if dg and da and dv and not dv.startswith("${"):
+                    direct.append({"group_id": dg, "artifact_id": da,
+                                   "version": dv, "scope": ds})
+
+        result = {"props": props, "dep_mgmt": dep_mgmt, "direct": direct}
+        pom_cache[key] = result
+        return result
+
+    # ── BFS over the full dependency graph ────────────────────────────────────
+    seen: dict[str, str] = {}   # group:artifact -> version (nearest wins)
+    resolved: list[dict] = []
+    queue: list[dict] = list(coords)
+
+    while queue and len(resolved) < MAX_DEPS:
+        dep = queue.pop(0)
+        g = dep.get("group_id", "").strip()
+        a = dep.get("artifact_id", "").strip()
+        v = dep.get("version", "").strip()
+
+        if not g or not a or not v or v == "UNKNOWN":
+            continue
+
+        ga_key = f"{g}:{a}"
+        if ga_key in seen:
+            continue        # already have this artifact (nearest-wins)
+        seen[ga_key] = v
+        resolved.append(dep)
+
+        pom_data = fetch_pom(g, a, v)
+        for child in pom_data.get("direct", []):
+            ck = f"{child['group_id']}:{child['artifact_id']}"
+            if ck not in seen:
+                queue.append(child)
+
+    return resolved
+
+
 def _run_dep_scan(dep_input: str) -> str:
     """Synchronous dependency-list scan — runs in a thread via asyncio.to_thread."""
     from crewai import Agent
@@ -527,13 +673,46 @@ def _run_dep_scan(dep_input: str) -> str:
         verbose=True,
     )
 
+    # Parse the raw input into structured coords, then expand to direct transitives
+    # via Maven Central POM fetch before the LLM sees the list.
+    parsed_coords: list[dict] = []
+    for line in dep_input.splitlines():
+        line = line.strip()
+        if not line or line.startswith("#"):
+            continue
+        parts = line.split(":")
+        if len(parts) >= 3:
+            parsed_coords.append({
+                "group_id": parts[0].strip(),
+                "artifact_id": parts[1].strip(),
+                "version": parts[2].strip(),
+                "scope": "compile",
+            })
+
+    if parsed_coords:
+        expanded_coords = _expand_maven_deps(parsed_coords)
+        expanded_json = json.dumps(expanded_coords, indent=2)
+        recon_desc = (
+            f"Validate and confirm this pre-expanded dependency list "
+            f"(direct inputs + their Maven transitive dependencies). "
+            f"Return it as-is as a JSON array:\n\n{expanded_json}"
+        )
+    else:
+        expanded_json = "[]"
+        recon_desc = (
+            f"Parse this dependency list into JSON with group_id, artifact_id, version:\n\n{dep_input}"
+        )
+
     recon_task = Task(
-        description=f"Parse this dependency list into JSON with group_id, artifact_id, version:\n\n{dep_input}",
+        description=recon_desc,
         expected_output="A JSON array of packages with group_id, artifact_id, and version.",
         agent=recon_agent,
     )
     vuln_task = Task(
-        description="Use the 'Check OSV Vulnerabilities' tool with the JSON array from the previous step.",
+        description=(
+            "Use the 'Check OSV Vulnerabilities' tool with the full JSON array from the previous step. "
+            "Pass ALL entries — including transitive dependencies."
+        ),
         expected_output="Raw CVE findings for each dependency.",
         agent=vuln_agent,
     )
