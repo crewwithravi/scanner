@@ -8,9 +8,14 @@ import os
 import re
 import subprocess
 import json
+import time
 import requests
 from typing import Optional
 from crewai.tools import BaseTool
+
+# Module-level cache: NVD product CVEs fetched once per scan session
+# Key: "vendor:product", Value: list of NVD vulnerability dicts
+_NVD_PRODUCT_CVE_CACHE: dict = {}
 
 
 class DetectBuildSystemTool(BaseTool):
@@ -264,6 +269,17 @@ class OSVVulnerabilityCheckTool(BaseTool):
         "Returns: JSON report of vulnerabilities found."
     )
 
+    # OSV does NOT track these group IDs as Maven artifacts (only GIT ranges).
+    # For these, we fall back to NVD CPE-based version-range lookups.
+    # Format: group_id_prefix -> (nvd_vendor, nvd_product, keyword_for_nvd_api)
+    MAVEN_CPE_MAP: dict = {
+        "org.apache.tomcat.embed": ("apache", "tomcat", "Apache Tomcat"),
+        "org.apache.tomcat":       ("apache", "tomcat", "Apache Tomcat"),
+        "org.apache.struts":       ("apache", "struts2", "Apache Struts"),
+        "org.apache.logging.log4j": ("apache", "log4j2", "Apache Log4j"),
+        "org.apache.log4j":        ("apache", "log4j2", "Apache Log4j"),
+    }
+
     def _run(self, dependencies_json: str) -> str:
         try:
             dependencies = json.loads(dependencies_json)
@@ -331,25 +347,252 @@ class OSVVulnerabilityCheckTool(BaseTool):
             dep = dep_map[idx]
             vulns = result.get("vulns", [])
 
-            if vulns:
-                report["vulnerable_count"] += 1
-                vuln_ids = [v.get("id", "unknown") for v in vulns]
+            if not vulns:
+                # OSV blind-spot fallback: check NVD for packages OSV doesn't index as Maven
+                nvd_vulns = self._check_nvd_fallback(dep)
+                if nvd_vulns:
+                    report["vulnerable_count"] += 1
+                    vuln_ids = [v["id"] for v in nvd_vulns]
+                    report["vulnerabilities"].append({
+                        "dependency": f"{dep['group_id']}:{dep['artifact_id']}:{dep['version']}",
+                        "vulnerability_ids": vuln_ids,
+                        "details": nvd_vulns,
+                        "source": "NVD",
+                    })
+                else:
+                    report["safe_count"] += 1
+                continue
 
-                vuln_details = []
-                for vuln_id in vuln_ids[:5]:
-                    detail = self._get_vuln_details(vuln_id)
-                    if detail:
-                        vuln_details.append(detail)
+            report["vulnerable_count"] += 1
+            vuln_ids = [v.get("id", "unknown") for v in vulns]
 
-                report["vulnerabilities"].append({
-                    "dependency": f"{dep['group_id']}:{dep['artifact_id']}:{dep['version']}",
-                    "vulnerability_ids": vuln_ids,
-                    "details": vuln_details,
-                })
-            else:
-                report["safe_count"] += 1
+            vuln_details = []
+            for vuln_id in vuln_ids[:5]:
+                detail = self._get_vuln_details(vuln_id)
+                if detail:
+                    vuln_details.append(detail)
+
+            report["vulnerabilities"].append({
+                "dependency": f"{dep['group_id']}:{dep['artifact_id']}:{dep['version']}",
+                "vulnerability_ids": vuln_ids,
+                "details": vuln_details,
+            })
 
         return json.dumps(report, indent=2)
+
+    # ── NVD fallback for OSV blind spots ─────────────────────────────────────
+
+    def _check_nvd_fallback(self, dep: dict) -> list:
+        """Return list of NVD vuln dicts for deps that OSV doesn't track as Maven."""
+        group_id = dep.get("group_id", "")
+        version = dep.get("version", "")
+        if not version or version == "UNKNOWN":
+            return []
+
+        cpe_info = self.MAVEN_CPE_MAP.get(group_id)
+        if not cpe_info:
+            return []
+
+        vendor, product, keyword = cpe_info
+        cache_key = f"{vendor}:{product}"
+
+        if cache_key not in _NVD_PRODUCT_CVE_CACHE:
+            _NVD_PRODUCT_CVE_CACHE[cache_key] = self._fetch_nvd_cves_for_product(keyword, product)
+
+        affected = []
+        for nvd_vuln in _NVD_PRODUCT_CVE_CACHE[cache_key]:
+            detail = self._nvd_vuln_detail(nvd_vuln, version, product)
+            if detail:
+                affected.append(detail)
+        return affected
+
+    def _fetch_nvd_cves_for_product(self, keyword: str, product: str) -> list:
+        """Fetch all NVD CVEs for a product keyword (paginated, cached per product)."""
+        all_vulns = []
+        start = 0
+        per_page = 2000
+
+        while True:
+            try:
+                resp = requests.get(
+                    "https://services.nvd.nist.gov/rest/json/cves/2.0",
+                    params={
+                        "keywordSearch": keyword,
+                        "resultsPerPage": per_page,
+                        "startIndex": start,
+                    },
+                    timeout=45,
+                )
+                resp.raise_for_status()
+                data = resp.json()
+                vulns = data.get("vulnerabilities", [])
+                all_vulns.extend(vulns)
+                total = data.get("totalResults", 0)
+                if start + per_page >= total:
+                    break
+                start += per_page
+                time.sleep(0.7)  # NVD rate limit: 5 req/30 s without API key
+            except requests.exceptions.RequestException:
+                break
+
+        return all_vulns
+
+    def _nvd_vuln_detail(self, nvd_vuln: dict, version: str, product: str) -> Optional[dict]:
+        """
+        Check if `version` falls in the NVD CPE version ranges for this CVE.
+        Returns a formatted detail dict if affected, else None.
+        """
+        cve = nvd_vuln.get("cve", {})
+
+        # Extract description text — full for heuristic, truncated for display
+        desc_full = ""
+        for d in cve.get("descriptions", []):
+            if d.get("lang") == "en":
+                desc_full = d.get("value", "")
+                break
+        desc = desc_full[:300]
+
+        configs = cve.get("configurations", [])
+        if not configs:
+            # New/unprocessed CVE — no CPE config yet.
+            # Fall back to parsing version ranges from the description text.
+            if not self._desc_version_affected(desc_full, version, product):
+                return None
+            # Description heuristic matched — build detail with a note
+            severity, score = self._extract_nvd_severity(cve)
+            refs = [ref.get("url", "") for ref in cve.get("references", [])[:3]]
+            return {
+                "id": cve.get("id", "unknown"),
+                "summary": (desc or "No description available") + " [⚠ NVD CPE not yet processed]",
+                "severity": severity,
+                "fixed_versions": [],
+                "aliases": [],
+                "references": refs,
+                "cvss_score": score,
+            }
+
+        ver_parts = self._parse_version(version)
+        fixed_versions = []
+        matched = False
+
+        for config in configs:
+            for node in config.get("nodes", []):
+                for match in node.get("cpeMatch", []):
+                    if not match.get("vulnerable", True):
+                        continue
+                    criteria = match.get("criteria", "").lower()
+                    if product not in criteria:
+                        continue
+
+                    # CPE criteria format: cpe:2.3:a:vendor:product:VERSION:...
+                    # Extract the version field (index 5). "*" means "any version" (use range fields).
+                    criteria_raw = match.get("criteria", "")
+                    cpe_fields = criteria_raw.split(":")
+                    cpe_version = cpe_fields[5] if len(cpe_fields) > 5 else "*"
+
+                    if cpe_version != "*" and cpe_version != "-":
+                        # Exact-version CPE (old CVEs): only match if versions are equal
+                        if self._parse_version(cpe_version) != ver_parts:
+                            continue
+                        matched = True
+                        break  # Found an exact match, no need to check ranges
+
+                    vsi = self._parse_version(match.get("versionStartIncluding", ""))
+                    vse = self._parse_version(match.get("versionStartExcluding", ""))
+                    vei = self._parse_version(match.get("versionEndIncluding", ""))
+                    vee = self._parse_version(match.get("versionEndExcluding", ""))
+
+                    # If criteria is wildcard AND no range constraints → skip (too broad, avoid FP)
+                    if not vsi and not vse and not vei and not vee:
+                        continue
+
+                    start_ok = (not vsi and not vse) or \
+                               (vsi and ver_parts >= vsi) or \
+                               (vse and ver_parts > vse)
+                    end_ok = (not vei and not vee) or \
+                             (vei and ver_parts <= vei) or \
+                             (vee and ver_parts < vee)
+
+                    if start_ok and end_ok:
+                        matched = True
+                        if vee:
+                            fv = match.get("versionEndExcluding", "")
+                            if fv and fv not in fixed_versions:
+                                fixed_versions.append(fv)
+
+        if not matched:
+            return None
+
+        severity, score = self._extract_nvd_severity(cve)
+        refs = [ref.get("url", "") for ref in cve.get("references", [])[:3]]
+
+        return {
+            "id": cve.get("id", "unknown"),
+            "summary": desc or "No description available",
+            "severity": severity,
+            "fixed_versions": fixed_versions,
+            "aliases": [],
+            "references": refs,
+            "cvss_score": score,
+        }
+
+    def _extract_nvd_severity(self, cve: dict) -> tuple:
+        """Extract (severity_str, score_float) from NVD CVE metrics."""
+        severity = "UNKNOWN"
+        score = None
+        for metric_key in ("cvssMetricV40", "cvssMetricV31", "cvssMetricV30", "cvssMetricV2"):
+            metrics = cve.get("metrics", {}).get(metric_key, [])
+            if metrics:
+                cvss_data = metrics[0].get("cvssData", {})
+                score = cvss_data.get("baseScore")
+                sev = cvss_data.get("baseSeverity", "")
+                if sev:
+                    severity = sev.upper()
+                elif score is not None:
+                    severity = self._score_to_severity(float(score))
+                break
+        return severity, score
+
+    def _desc_version_affected(self, desc: str, version: str, product: str) -> bool:
+        """
+        Heuristic: parse version ranges from CVE description text.
+        Used only for new CVEs that NVD hasn't yet assigned CPE configurations.
+        Patterns matched:
+          - "from X.Y.Z through A.B.C"  (both inclusive)
+          - "through A.B.C"             (any version up to A.B.C)
+          - "before A.B.C"              (exclusive upper bound)
+        """
+        if not desc or product not in desc.lower():
+            return False
+
+        ver_parts = self._parse_version(version)
+        if not ver_parts:
+            return False
+
+        # "from X.Y.Z[-pre] through A.B.C[-pre]"
+        for m in re.finditer(
+            r'(?:from\s+([\d]+\.[\d]+[.\d]*(?:-[\w.]+)?)\s+)?'
+            r'through\s+([\d]+\.[\d]+[.\d]*(?:-[\w.]+)?)',
+            desc, re.IGNORECASE,
+        ):
+            start_str = m.group(1) or ""
+            end_str   = m.group(2) or ""
+            end_parts = self._parse_version(end_str)
+            if not end_parts or ver_parts > end_parts:
+                continue
+            if start_str:
+                start_parts = self._parse_version(start_str)
+                if ver_parts < start_parts:
+                    continue
+            return True
+
+        # "before A.B.C" (exclusive upper bound)
+        for m in re.finditer(r'before\s+([\d]+\.[\d]+[.\d]*)', desc, re.IGNORECASE):
+            end_parts = self._parse_version(m.group(1))
+            if end_parts and ver_parts < end_parts:
+                return True
+
+        return False
 
     def _get_vuln_details(self, vuln_id: str) -> Optional[dict]:
         try:
@@ -413,6 +656,19 @@ class OSVVulnerabilityCheckTool(BaseTool):
 
         except requests.exceptions.RequestException:
             return {"id": vuln_id, "summary": "Failed to fetch details", "severity": "UNKNOWN"}
+
+    @staticmethod
+    def _parse_version(version_str: str) -> tuple:
+        if not version_str:
+            return ()
+        clean = re.split(r"[-.]", re.sub(r"[^0-9.\-]", "", version_str))
+        parts = []
+        for p in clean:
+            try:
+                parts.append(int(p))
+            except ValueError:
+                break
+        return tuple(parts)
 
     @staticmethod
     def _score_to_severity(score: float) -> str:
