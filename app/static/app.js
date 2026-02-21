@@ -110,13 +110,27 @@ async function runScan() {
     });
     showResult(data.result);
   } catch (e) {
-    toast(e.message, true);
+    showError(e.message);
   } finally {
     btn.disabled = false;
     clearInterval(elapsedInterval);
     elapsedInterval = null;
     $("#scan-loading").classList.add("hidden");
   }
+}
+
+
+// ── Error display ────────────────────────────────────────────────
+function showError(msg) {
+  $("#summary-bar").innerHTML =
+    '<span class="badge badge-red">Scan Failed</span>';
+  $("#report-body").innerHTML = `
+    <div class="bg-red-900/20 border border-red-500/30 rounded-lg p-4">
+      <p class="text-red-400 font-medium mb-1">Error</p>
+      <p class="text-gray-300 text-sm font-mono break-all">${msg}</p>
+    </div>`;
+  $("#result-card").classList.remove("hidden");
+  $("#result-card").scrollIntoView({ behavior: "smooth", block: "start" });
 }
 
 
