@@ -183,18 +183,21 @@ class ExtractDependenciesTool(BaseTool):
                 pass
 
         if gradle_cmd:
-            try:
-                result = subprocess.run(
-                    [gradle_cmd, "dependencies", "--configuration", "runtimeClasspath", "-q"],
-                    cwd=repo_path,
-                    capture_output=True,
-                    text=True,
-                    timeout=120,
-                )
-                if result.returncode == 0:
-                    return self._parse_gradle_tree(result.stdout)
-            except (FileNotFoundError, PermissionError, OSError, subprocess.TimeoutExpired):
-                pass
+            for config in ["runtimeClasspath", "compileClasspath"]:
+                try:
+                    result = subprocess.run(
+                        [gradle_cmd, "dependencies", "--configuration", config, "--no-daemon"],
+                        cwd=repo_path,
+                        capture_output=True,
+                        text=True,
+                        timeout=120,
+                    )
+                    if result.returncode == 0:
+                        parsed = self._parse_gradle_tree(result.stdout)
+                        if not parsed.startswith("ERROR"):
+                            return parsed
+                except (FileNotFoundError, PermissionError, OSError, subprocess.TimeoutExpired):
+                    pass
 
         return self._parse_build_gradle(repo_path)
 
@@ -229,7 +232,10 @@ class ExtractDependenciesTool(BaseTool):
         return json.dumps(dependencies, indent=2)
 
     def _parse_build_gradle(self, repo_path: str) -> str:
+        import xml.etree.ElementTree as ET
+
         dependencies = []
+        seen: set[str] = set()
 
         for filename in ["build.gradle", "build.gradle.kts"]:
             filepath = os.path.join(repo_path, filename)
@@ -239,26 +245,232 @@ class ExtractDependenciesTool(BaseTool):
             with open(filepath, "r") as f:
                 content = f.read()
 
-            patterns = [
-                r"(?:implementation|api|compile|runtimeOnly|compileOnly|testImplementation)\s*['\"](\S+?):(\S+?):(\S+?)['\"]",
-                r"(?:implementation|api|compile|runtimeOnly|compileOnly|testImplementation)\s*\(\s*['\"](\S+?):(\S+?):(\S+?)['\"]",
-            ]
+            # Resolve Spring Boot BOM so we can version unversioned deps.
+            bom_versions: dict[str, str] = {}
+            sb_version = self._extract_spring_boot_version(content)
+            if sb_version:
+                bom_versions = self._fetch_spring_boot_bom(sb_version)
 
-            for pattern in patterns:
-                for match in re.finditer(pattern, content):
-                    dep_info = {
-                        "group_id": match.group(1),
-                        "artifact_id": match.group(2),
-                        "version": match.group(3),
+            # Extract every quoted group:artifact:version coordinate in the file.
+            # This catches versioned deps regardless of keyword or line continuation.
+            for m in re.finditer(
+                r"""['"]([A-Za-z0-9][\w.\-]*:[A-Za-z0-9][\w.\-]*:[A-Za-z0-9][\w.\-]*)['"]""",
+                content,
+            ):
+                coord = m.group(1)
+                if "$" in coord:
+                    continue
+                parts = coord.split(":")
+                if len(parts) != 3:
+                    continue
+                key = f"{parts[0]}:{parts[1]}"
+                if key not in seen:
+                    seen.add(key)
+                    dependencies.append({
+                        "group_id": parts[0],
+                        "artifact_id": parts[1],
+                        "version": parts[2],
                         "scope": "compile",
-                    }
-                    if "$" not in dep_info["version"]:
-                        dependencies.append(dep_info)
+                    })
+
+            # For unversioned deps (group:artifact only), look up in BOM.
+            if bom_versions:
+                for m in re.finditer(
+                    r"""['"]([A-Za-z0-9][\w.\-]*:[A-Za-z0-9][\w.\-]*)['"]""",
+                    content,
+                ):
+                    coord = m.group(1)
+                    if coord.count(":") != 1 or "$" in coord:
+                        continue
+                    version = bom_versions.get(coord)
+                    if version and coord not in seen:
+                        seen.add(coord)
+                        parts = coord.split(":")
+                        dependencies.append({
+                            "group_id": parts[0],
+                            "artifact_id": parts[1],
+                            "version": version,
+                            "scope": "compile",
+                        })
 
         if not dependencies:
             return "ERROR: No dependencies found in build.gradle"
 
-        return json.dumps(dependencies, indent=2)
+        return json.dumps(self._expand_transitive(dependencies), indent=2)
+
+    def _expand_transitive(self, direct: list[dict]) -> list[dict]:
+        """BFS over Maven Central POMs to resolve the full transitive dependency tree."""
+        import xml.etree.ElementTree as ET
+
+        SKIP_SCOPES = {"test", "provided", "system"}
+        pom_cache: dict[str, dict] = {}
+
+        def pom_url(g: str, a: str, v: str) -> str:
+            return f"https://repo1.maven.org/maven2/{g.replace('.', '/')}/{a}/{v}/{a}-{v}.pom"
+
+        def fetch_pom(g: str, a: str, v: str) -> dict:
+            key = f"{g}:{a}:{v}"
+            if key in pom_cache:
+                return pom_cache[key]
+            pom_cache[key] = {}
+            try:
+                resp = requests.get(pom_url(g, a, v), timeout=15)
+                if resp.status_code != 200:
+                    return {}
+                root = ET.fromstring(resp.text)
+            except Exception:
+                return {}
+
+            m = re.match(r"\{(.+?)\}", root.tag)
+            ns = f"{{{m.group(1)}}}" if m else ""
+
+            def txt(elem, tag: str, default: str = "") -> str:
+                return (elem.findtext(f"{ns}{tag}", default) or default).strip()
+
+            # 1. Parent chain
+            parent_props: dict[str, str] = {}
+            parent_dep_mgmt: dict[str, str] = {}
+            parent_elem = root.find(f"{ns}parent")
+            if parent_elem is not None:
+                pg = txt(parent_elem, "groupId")
+                pa = txt(parent_elem, "artifactId")
+                pv = txt(parent_elem, "version")
+                if pg and pa and pv and not pv.startswith("${"):
+                    pd = fetch_pom(pg, pa, pv)
+                    parent_props = pd.get("props", {})
+                    parent_dep_mgmt = pd.get("dep_mgmt", {})
+
+            # 2. Properties
+            props: dict[str, str] = {
+                "project.version": v,
+                "project.groupId": g,
+                "project.artifactId": a,
+                **parent_props,
+            }
+            props_elem = root.find(f"{ns}properties")
+            if props_elem is not None:
+                for p in props_elem:
+                    props[p.tag.replace(ns, "")] = (p.text or "").strip()
+
+            def resolve(val: str) -> str:
+                for _ in range(3):
+                    if not val.startswith("${"):
+                        break
+                    val = props.get(val[2:-1], val)
+                return val
+
+            # 3. dependencyManagement (including BOM imports)
+            dep_mgmt: dict[str, str] = dict(parent_dep_mgmt)
+            dm_elem = root.find(f"{ns}dependencyManagement/{ns}dependencies")
+            if dm_elem is not None:
+                for d in dm_elem.findall(f"{ns}dependency"):
+                    dg = resolve(txt(d, "groupId"))
+                    da = resolve(txt(d, "artifactId"))
+                    dv = resolve(txt(d, "version"))
+                    ds = txt(d, "scope", "compile")
+                    if ds == "import" and dg and da and dv and not dv.startswith("${"):
+                        bom = fetch_pom(dg, da, dv)
+                        for k, bv in bom.get("dep_mgmt", {}).items():
+                            dep_mgmt.setdefault(k, bv)
+                    elif dg and da and dv and not dv.startswith("${"):
+                        dep_mgmt[f"{dg}:{da}"] = dv
+
+            # 4. Direct dependencies
+            deps_direct: list[dict] = []
+            deps_elem = root.find(f"{ns}dependencies")
+            if deps_elem is not None:
+                for d in deps_elem.findall(f"{ns}dependency"):
+                    dg = resolve(txt(d, "groupId"))
+                    da = resolve(txt(d, "artifactId"))
+                    dv = resolve(txt(d, "version"))
+                    ds = txt(d, "scope", "compile")
+                    opt = txt(d, "optional", "false").lower()
+                    if ds in SKIP_SCOPES or opt == "true":
+                        continue
+                    if not dv or dv.startswith("${"):
+                        dv = dep_mgmt.get(f"{dg}:{da}", "")
+                    if dg and da and dv and not dv.startswith("${"):
+                        deps_direct.append({"group_id": dg, "artifact_id": da,
+                                            "version": dv, "scope": ds})
+
+            result = {"props": props, "dep_mgmt": dep_mgmt, "direct": deps_direct}
+            pom_cache[key] = result
+            return result
+
+        # BFS
+        seen: dict[str, str] = {}
+        resolved: list[dict] = []
+        queue: list[dict] = list(direct)
+
+        while queue and len(resolved) < 10_000:
+            dep = queue.pop(0)
+            g = dep.get("group_id", "").strip()
+            a = dep.get("artifact_id", "").strip()
+            v = dep.get("version", "").strip()
+            if not g or not a or not v or v == "UNKNOWN":
+                continue
+            ga_key = f"{g}:{a}"
+            if ga_key in seen:
+                continue
+            seen[ga_key] = v
+            resolved.append(dep)
+            pom_data = fetch_pom(g, a, v)
+            for child in pom_data.get("direct", []):
+                if f"{child['group_id']}:{child['artifact_id']}" not in seen:
+                    queue.append(child)
+
+        return resolved
+
+    def _extract_spring_boot_version(self, content: str) -> str | None:
+        """Extract Spring Boot plugin version from a Gradle build file."""
+        for pattern in [
+            r"""id\s*['"]org\.springframework\.boot['"]\s+version\s+['"]([^'"]+)['"]""",
+            r"""id\("org\.springframework\.boot"\)\s+version\s+"([^"]+)""",
+        ]:
+            m = re.search(pattern, content)
+            if m:
+                return m.group(1)
+        return None
+
+    def _fetch_spring_boot_bom(self, version: str) -> dict[str, str]:
+        """Fetch the Spring Boot BOM POM and return {group:artifact: version} map."""
+        import xml.etree.ElementTree as ET
+
+        url = (
+            f"https://repo1.maven.org/maven2/org/springframework/boot/"
+            f"spring-boot-dependencies/{version}/spring-boot-dependencies-{version}.pom"
+        )
+        try:
+            resp = requests.get(url, timeout=30)
+            if resp.status_code != 200:
+                return {}
+            root = ET.fromstring(resp.text)
+            ns_m = re.match(r"\{(.+?)\}", root.tag)
+            ns = f"{{{ns_m.group(1)}}}" if ns_m else ""
+
+            # Collect <properties> for ${...} resolution.
+            props: dict[str, str] = {}
+            props_elem = root.find(f"{ns}properties")
+            if props_elem is not None:
+                for child in props_elem:
+                    tag = child.tag.replace(ns, "")
+                    props[tag] = child.text or ""
+
+            # Build the version map from <dependencyManagement>.
+            bom: dict[str, str] = {}
+            dep_mgmt = root.find(f"{ns}dependencyManagement/{ns}dependencies")
+            if dep_mgmt is not None:
+                for dep in dep_mgmt.findall(f"{ns}dependency"):
+                    g = (dep.findtext(f"{ns}groupId") or "").strip()
+                    a = (dep.findtext(f"{ns}artifactId") or "").strip()
+                    v = (dep.findtext(f"{ns}version") or "").strip()
+                    if v.startswith("${") and v.endswith("}"):
+                        v = props.get(v[2:-1], v)
+                    if g and a and v and not v.startswith("${"):
+                        bom[f"{g}:{a}"] = v
+            return bom
+        except Exception:
+            return {}
 
 
 class OSVVulnerabilityCheckTool(BaseTool):

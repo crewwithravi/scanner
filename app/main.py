@@ -332,39 +332,88 @@ def validate_report_dependencies(
         )
 
 
-def create_tasks(repo_scanner, vuln_analyst, upgrade_strategist, report_generator, repo_path: str):
-    """Create the full 4-task pipeline for repo scanning."""
+def create_tasks(
+    repo_scanner, vuln_analyst, upgrade_strategist, report_generator,
+    repo_path: str,
+    build_system: str = "",
+    deps_json: str = "",
+):
+    """Create the full 5-task pipeline for repo scanning.
 
-    scan_task = Task(
-        description=(
-            f"Analyze the repository at path: {repo_path}\n\n"
-            "Steps:\n"
-            "1. Use the 'Detect Build System' tool with the repo path to determine if it's Maven or Gradle.\n"
-            "2. Use the 'Extract Dependencies' tool with repo_path and build_system:\n"
-            f'   repo_path: "{repo_path}", build_system: "<detected_system>"\n'
-            "3. Return the complete list of dependencies as JSON.\n\n"
-            "IMPORTANT: Pass the exact repo path as a string to the Detect Build System tool. "
-            "For Extract Dependencies, pass repo_path and build_system as tool arguments."
-        ),
-        expected_output=(
-            "A JSON object with exactly two fields:\n"
-            '{"build_system": "maven or gradle", "dependencies": [...]}\n'
-            "The 'dependencies' value must be the COMPLETE JSON array returned by the "
-            "Extract Dependencies tool. Each object has: group_id, artifact_id, version, scope."
-        ),
-        agent=repo_scanner,
-    )
+    build_system and deps_json are pre-computed before agents run so the LLMs
+    never have to call extraction tools or parse large JSON from context.
+    """
+    n_deps = 0
+    if deps_json:
+        try:
+            n_deps = len(json.loads(deps_json))
+        except Exception:
+            pass
 
+    # ── Task 1: Build system detection ───────────────────────────────────────
+    if build_system:
+        build_task = Task(
+            description=(
+                f"The build system for the repository at {repo_path} has already been "
+                f"detected as: **{build_system}**.\n\n"
+                "Confirm this result and return it."
+            ),
+            expected_output=f'The detected build system: "{build_system}"',
+            agent=repo_scanner,
+        )
+    else:
+        build_task = Task(
+            description=(
+                f"Use the 'Detect Build System' tool on the repository at: {repo_path}\n\n"
+                "Return only the detected build system name ('maven' or 'gradle')."
+            ),
+            expected_output="The detected build system: 'maven' or 'gradle'.",
+            agent=repo_scanner,
+        )
+
+    # ── Task 2: Dependency extraction ────────────────────────────────────────
+    if deps_json and n_deps > 0:
+        dep_task = Task(
+            description=(
+                f"The complete dependency tree for the {build_system} project at {repo_path} "
+                f"has already been extracted ({n_deps} dependencies, including transitive).\n\n"
+                f"Here is the full dependency list:\n\n{deps_json}\n\n"
+                "Return this exact JSON array as your output. Do NOT modify it."
+            ),
+            expected_output=(
+                f"The complete JSON array of {n_deps} dependencies. "
+                "Each object has: group_id, artifact_id, version, scope."
+            ),
+            agent=repo_scanner,
+            context=[build_task],
+        )
+    else:
+        dep_task = Task(
+            description=(
+                f"Use the 'Extract Dependencies' tool to get ALL dependencies "
+                f"(including transitive) for the repository at: {repo_path}\n\n"
+                f"The build system is: {build_system or 'from the previous task'}\n\n"
+                "Pass repo_path and build_system as arguments. "
+                "Return the complete JSON array from the tool."
+            ),
+            expected_output=(
+                "The complete JSON array of dependencies. "
+                "Each object has: group_id, artifact_id, version, scope."
+            ),
+            agent=repo_scanner,
+            context=[build_task],
+        )
+
+    # ── Task 3: Vulnerability check ───────────────────────────────────────────
     vuln_task = Task(
         description=(
             "Check ALL dependencies from the previous task against the OSV vulnerability database.\n\n"
-            "The previous task produced a JSON object with a 'dependencies' key.\n\n"
+            "The previous task output is a JSON array of dependencies.\n\n"
             "Steps:\n"
-            "1. Find the 'dependencies' JSON array from the previous task.\n"
-            "2. Pass that ENTIRE array to the 'Check OSV Vulnerabilities' tool.\n"
+            "1. Take the COMPLETE JSON array from the previous task output.\n"
+            "2. Pass that ENTIRE array as-is to the 'Check OSV Vulnerabilities' tool.\n"
             "3. Return the tool's full JSON result as-is.\n\n"
-            "IMPORTANT: The tool expects a JSON ARRAY of dependency objects. "
-            "Pass all dependencies in a single call.\n\n"
+            "IMPORTANT: The tool expects a JSON ARRAY. Pass ALL dependencies in a single call.\n\n"
             "CRITICAL: After getting results, COUNT the vulnerable dependencies. "
             "The vulnerable_count MUST match the vulnerabilities array length. "
             "Do NOT drop or omit any — especially CRITICAL ones like Log4Shell (log4j)."
@@ -376,7 +425,7 @@ def create_tasks(repo_scanner, vuln_analyst, upgrade_strategist, report_generato
             "and fixed versions. Do NOT summarize or omit entries."
         ),
         agent=vuln_analyst,
-        context=[scan_task],
+        context=[dep_task],
     )
 
     upgrade_task = Task(
@@ -408,7 +457,7 @@ def create_tasks(repo_scanner, vuln_analyst, upgrade_strategist, report_generato
             "safe_to_upgrade (boolean), migration_steps."
         ),
         agent=upgrade_strategist,
-        context=[scan_task, vuln_task],
+        context=[dep_task, vuln_task],
     )
 
     report_task = Task(
@@ -468,18 +517,33 @@ def create_tasks(repo_scanner, vuln_analyst, upgrade_strategist, report_generato
             "Do NOT wrap the output in code fences."
         ),
         agent=report_generator,
-        context=[scan_task, vuln_task, upgrade_task],
+        context=[build_task, dep_task, vuln_task, upgrade_task],
     )
 
-    return [scan_task, vuln_task, upgrade_task, report_task]
+    return [build_task, dep_task, vuln_task, upgrade_task, report_task]
 
 
 def _run_full_scan(scan_path: str) -> str:
     """Synchronous full-repo scan — runs in a thread via asyncio.to_thread."""
+    # Pre-compute build system + full transitive dep tree before the LLM pipeline
+    # starts. This avoids the LLM having to call extraction tools and eliminates
+    # fragile large-JSON context handoff between tasks.
+    build_system = DetectBuildSystemTool()._run(scan_path)
+    if build_system.startswith("ERROR") or build_system == "unknown":
+        raise ValueError(f"Failed to detect build system: {build_system}")
+
+    deps_json = ExtractDependenciesTool()._run(scan_path, build_system)
+    try:
+        json.loads(deps_json)
+    except Exception:
+        deps_json = ""  # tool unavailable; let agents call it themselves
+
     repo_scanner, vuln_analyst, upgrade_strategist, report_generator = create_agents()
     tasks = create_tasks(
         repo_scanner, vuln_analyst, upgrade_strategist, report_generator,
         scan_path,
+        build_system=build_system,
+        deps_json=deps_json,
     )
     crew = Crew(
         agents=[repo_scanner, vuln_analyst, upgrade_strategist, report_generator],
