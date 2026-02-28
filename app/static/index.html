@@ -1,0 +1,438 @@
+<!DOCTYPE html>
+<html lang="en" class="dark">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>VulnHawk — AI Vulnerability Scanner</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com" />
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+  <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500&display=swap" rel="stylesheet" />
+  <script src="https://cdn.tailwindcss.com"></script>
+  <script src="https://cdn.jsdelivr.net/npm/marked/marked.min.js"></script>
+  <script>
+    tailwind.config = {
+      darkMode: 'class',
+      theme: {
+        extend: {
+          colors: {
+            brand: { 500:'#ef4444', 600:'#dc2626', 700:'#b91c1c' },
+            surface: { 950:'#09090f', 900:'#0f0f1a', 800:'#1a1a2e', 700:'#242438', 600:'#2e2e46' },
+          }
+        }
+      }
+    }
+  </script>
+  <style>
+    * { font-family: 'Inter', system-ui, sans-serif; }
+
+    body {
+      background: #09090f;
+      background-image:
+        radial-gradient(ellipse 90% 55% at 50% -5%, rgba(220,38,38,0.13) 0%, transparent 65%),
+        linear-gradient(rgba(220,38,38,0.025) 1px, transparent 1px),
+        linear-gradient(90deg, rgba(220,38,38,0.025) 1px, transparent 1px);
+      background-size: 100% 100%, 48px 48px, 48px 48px;
+    }
+
+    /* ── Glass ──────────────────────────────────────────────── */
+    .glass {
+      background: rgba(20,20,36,0.75);
+      backdrop-filter: blur(24px);
+      -webkit-backdrop-filter: blur(24px);
+      border: 1px solid rgba(255,255,255,0.07);
+    }
+
+    /* ── Spinner ────────────────────────────────────────────── */
+    .pulse-dot { animation: pulse-ring 2s ease-out infinite; }
+    @keyframes pulse-ring {
+      0%   { box-shadow: 0 0 0 0 rgba(34,197,94,0.5); }
+      70%  { box-shadow: 0 0 0 8px rgba(34,197,94,0); }
+      100% { box-shadow: 0 0 0 0 rgba(34,197,94,0); }
+    }
+    .spinner {
+      border: 2px solid rgba(255,255,255,0.08);
+      border-top-color: #ef4444;
+      border-radius: 50%; width: 13px; height: 13px;
+      animation: spin .7s linear infinite; display: inline-block;
+    }
+    .spinner-lg {
+      border: 3px solid rgba(255,255,255,0.07);
+      border-top-color: #ef4444;
+      border-radius: 50%; width: 48px; height: 48px;
+      animation: spin .85s linear infinite; display: inline-block;
+    }
+    @keyframes spin { to { transform: rotate(360deg); } }
+    .fade-in { animation: fadeIn .4s ease-out; }
+    @keyframes fadeIn { from { opacity: 0; transform: translateY(14px); } to { opacity: 1; transform: none; } }
+
+    /* ── Scan button ────────────────────────────────────────── */
+    .btn-scan {
+      background: linear-gradient(135deg, #dc2626 0%, #991b1b 100%);
+      box-shadow: 0 4px 24px rgba(220,38,38,0.3), 0 1px 3px rgba(0,0,0,0.4);
+      transition: all .2s ease;
+    }
+    .btn-scan:hover:not(:disabled) {
+      background: linear-gradient(135deg, #ef4444 0%, #b91c1c 100%);
+      box-shadow: 0 6px 32px rgba(220,38,38,0.45), 0 1px 3px rgba(0,0,0,0.4);
+      transform: translateY(-1px);
+    }
+    .btn-scan:disabled { opacity: 0.45; cursor: not-allowed; box-shadow: none; transform: none; }
+
+    /* ── Mode toggle ────────────────────────────────────────── */
+    .scan-mode-btn { transition: all .15s; color: #6b7280; }
+    .scan-mode-btn.active {
+      background: rgba(220,38,38,0.15) !important;
+      border-color: rgba(220,38,38,0.35) !important;
+      color: #fca5a5 !important;
+    }
+    .scan-mode-btn:hover:not(.active) { color: #9ca3af; }
+
+    /* ── Inputs ─────────────────────────────────────────────── */
+    input[type="text"], textarea {
+      background: rgba(9,9,15,0.8);
+      border: 1px solid rgba(255,255,255,0.08);
+      color: #f1f5f9;
+      transition: border-color .15s, box-shadow .15s;
+    }
+    input[type="text"]::placeholder, textarea::placeholder { color: #2d3748; }
+    input[type="text"]:focus, textarea:focus {
+      outline: none;
+      border-color: rgba(220,38,38,0.45);
+      box-shadow: 0 0 0 3px rgba(220,38,38,0.08);
+    }
+
+    /* ── Report typography ──────────────────────────────────── */
+    .ai-content h1 { color: #fca5a5; margin-top: 1.4em; margin-bottom: .6em; font-weight: 700; font-size: 1.2rem; }
+    .ai-content h2 {
+      display: flex; align-items: center; gap: 10px;
+      color: #f9fafb; font-weight: 700; font-size: .9rem;
+      background: rgba(220,38,38,0.07);
+      border-left: 3px solid #ef4444;
+      padding: 10px 16px; border-radius: 0 10px 10px 0;
+      margin-top: 2em; margin-bottom: .85em;
+      scroll-margin-top: 80px;
+    }
+    .ai-content h3 { color: #fcd34d; margin-top: 1em; margin-bottom: .4em; font-weight: 600; font-size: .85rem; }
+    .ai-content p  { margin-bottom: .65em; color: #94a3b8; line-height: 1.75; font-size: .84rem; }
+    .ai-content ul, .ai-content ol { margin-left: 1.5em; margin-bottom: .75em; }
+    .ai-content li { margin-bottom: .3em; color: #94a3b8; font-size: .84rem; }
+    .ai-content strong { color: #e2e8f0; }
+    .ai-content code {
+      background: rgba(255,255,255,0.07); padding: 1px 7px; border-radius: 5px;
+      font-size: .78em; color: #fcd34d;
+      font-family: 'JetBrains Mono', monospace;
+      border: 1px solid rgba(255,255,255,0.05);
+    }
+    .ai-content pre {
+      background: rgba(0,0,0,0.45); padding: 16px; border-radius: 10px;
+      overflow-x: auto; margin-bottom: 1em;
+      border: 1px solid rgba(255,255,255,0.05);
+    }
+    .ai-content pre code { background: none; padding: 0; color: #e2e8f0; font-size: .77rem; border: none; }
+    .ai-content hr { border-color: rgba(255,255,255,0.05); margin: 1.5em 0; }
+    .ai-content blockquote {
+      border-left: 3px solid rgba(220,38,38,0.4);
+      padding: 8px 16px; margin: .8em 0;
+      background: rgba(220,38,38,0.04);
+      border-radius: 0 8px 8px 0;
+      color: #94a3b8;
+    }
+
+    /* ── Tables ─────────────────────────────────────────────── */
+    .table-wrap {
+      overflow-x: auto; margin-bottom: 1.4em;
+      border-radius: 10px; border: 1px solid rgba(255,255,255,0.07);
+      box-shadow: 0 4px 16px rgba(0,0,0,0.3);
+    }
+    .ai-content table { width: 100%; border-collapse: collapse; font-size: .77rem; }
+    .ai-content th {
+      background: rgba(220,38,38,0.08); color: #fca5a5;
+      padding: 10px 14px; text-align: left;
+      border-bottom: 1px solid rgba(220,38,38,0.15);
+      white-space: nowrap; font-weight: 600;
+      font-size: .7rem; text-transform: uppercase; letter-spacing: .06em;
+    }
+    .ai-content td {
+      padding: 8px 14px; border-bottom: 1px solid rgba(255,255,255,0.04);
+      color: #94a3b8; vertical-align: top; line-height: 1.55;
+    }
+    .ai-content tr:last-child td { border-bottom: none; }
+    .ai-content tr:hover td { background: rgba(255,255,255,0.02); }
+    .dep-name {
+      font-family: 'JetBrains Mono', monospace !important;
+      font-size: .7rem !important; color: #cbd5e1 !important;
+      word-break: break-all;
+    }
+
+    /* ── Severity badges ────────────────────────────────────── */
+    .sev-badge {
+      font-size: .62rem; padding: 2px 9px; border-radius: 9999px;
+      font-weight: 700; text-transform: uppercase; letter-spacing: .07em;
+      display: inline-block; white-space: nowrap;
+    }
+    .sev-critical { background: rgba(239,68,68,.13);  color: #fca5a5; border: 1px solid rgba(239,68,68,.28); }
+    .sev-high     { background: rgba(249,115,22,.13); color: #fdba74; border: 1px solid rgba(249,115,22,.28); }
+    .sev-medium   { background: rgba(234,179,8,.13);  color: #fde68a; border: 1px solid rgba(234,179,8,.28); }
+    .sev-low      { background: rgba(59,130,246,.13); color: #93c5fd; border: 1px solid rgba(59,130,246,.28); }
+    .sev-unknown  { background: rgba(107,114,128,.1); color: #9ca3af; border: 1px solid rgba(107,114,128,.22); }
+
+    /* ── Safe YES / NO ──────────────────────────────────────── */
+    .safe-yes    { background: rgba(34,197,94,.1);  color: #4ade80; border: 1px solid rgba(34,197,94,.25);  font-size: .62rem; padding: 2px 9px; border-radius: 9999px; font-weight: 700; display: inline-block; }
+    .safe-no     { background: rgba(239,68,68,.1);  color: #f87171; border: 1px solid rgba(239,68,68,.25);  font-size: .62rem; padding: 2px 9px; border-radius: 9999px; font-weight: 700; display: inline-block; }
+    .status-safe     { background: rgba(34,197,94,.08); color: #4ade80; border: 1px solid rgba(34,197,94,.18); font-size: .62rem; padding: 2px 9px; border-radius: 9999px; font-weight: 700; display: inline-block; }
+    .type-direct     { background: rgba(99,102,241,.1);  color: #a5b4fc; border: 1px solid rgba(99,102,241,.22);   font-size: .62rem; padding: 2px 8px; border-radius: 9999px; font-weight: 600; display: inline-block; }
+    .type-transitive { background: rgba(107,114,128,.07); color: #6b7280; border: 1px solid rgba(107,114,128,.18); font-size: .62rem; padding: 2px 8px; border-radius: 9999px; font-weight: 500; display: inline-block; }
+
+    /* ── Upgrade arrow ──────────────────────────────────────── */
+    .upgrade-arrow { color: #34d399; font-weight: 700; margin: 0 4px; }
+    .dep-from { font-family: 'JetBrains Mono', monospace; font-size: .7rem; color: #64748b; }
+    .dep-to   { font-family: 'JetBrains Mono', monospace; font-size: .7rem; color: #6ee7b7; font-weight: 600; }
+
+    /* ── Section nav ────────────────────────────────────────── */
+    .section-nav { display: flex; gap: 4px; overflow-x: auto; padding-bottom: 1px; scrollbar-width: none; -ms-overflow-style: none; }
+    .section-nav::-webkit-scrollbar { display: none; }
+    .section-nav button {
+      white-space: nowrap; font-size: .67rem; padding: 4px 12px;
+      border-radius: 9999px; background: rgba(255,255,255,0.04);
+      color: #4b5563; border: 1px solid rgba(255,255,255,0.06);
+      cursor: pointer; transition: all .15s; font-weight: 500;
+    }
+    .section-nav button:hover { background: rgba(220,38,38,0.08); color: #fca5a5; border-color: rgba(220,38,38,0.2); }
+    .section-nav button.active { background: rgba(220,38,38,0.1); color: #fca5a5; border-color: rgba(220,38,38,0.25); }
+
+    /* ── Tab buttons ─────────────────────────────────────────── */
+    .tab-btn { transition: all .15s; color: #6b7280; font-weight: 500; }
+    .tab-btn.active { background: rgba(220,38,38,0.15); color: #fca5a5; }
+    .tab-btn:hover:not(.active) { color: #9ca3af; }
+
+    /* ── Dep filter pills ───────────────────────────────────── */
+    .dep-filter {
+      font-size: .67rem; padding: 3px 11px; border-radius: 9999px;
+      background: rgba(255,255,255,0.04); color: #4b5563;
+      border: 1px solid rgba(255,255,255,0.06);
+      cursor: pointer; transition: all .15s; font-weight: 500; white-space: nowrap;
+    }
+    .dep-filter:hover:not(.active) { color: #9ca3af; }
+    .dep-filter.active { background: rgba(220,38,38,0.1); color: #fca5a5; border-color: rgba(220,38,38,0.25); }
+
+    /* ── Summary bar badges ─────────────────────────────────── */
+    .badge { font-size: .62rem; padding: 2px 10px; border-radius: 9999px; font-weight: 700; text-transform: uppercase; letter-spacing: .05em; }
+    .badge-red    { background: rgba(239,68,68,.1);  color: #f87171; border: 1px solid rgba(239,68,68,.2); }
+    .badge-orange { background: rgba(249,115,22,.1); color: #fb923c; border: 1px solid rgba(249,115,22,.2); }
+    .badge-yellow { background: rgba(234,179,8,.1);  color: #facc15; border: 1px solid rgba(234,179,8,.2); }
+    .badge-green  { background: rgba(34,197,94,.1);  color: #4ade80; border: 1px solid rgba(34,197,94,.2); }
+    .badge-blue   { background: rgba(59,130,246,.1); color: #60a5fa; border: 1px solid rgba(59,130,246,.2); }
+
+    /* ── Loading steps ──────────────────────────────────────── */
+    .step { display: flex; align-items: center; gap: 12px; padding: 6px 0; }
+    .step-dot { width: 8px; height: 8px; border-radius: 50%; flex-shrink: 0; transition: background .3s; }
+    .step-done   { background: #22c55e; box-shadow: 0 0 8px rgba(34,197,94,0.45); }
+    .step-active { background: #ef4444; animation: pulse-ring 1.5s ease-out infinite; }
+    .step-wait   { background: rgba(255,255,255,0.1); }
+    .step-label         { font-size: .8rem; transition: color .3s; }
+    .step-label.done    { color: #4ade80; }
+    .step-label.active  { color: #fca5a5; }
+    .step-label.waiting { color: #374151; }
+
+    /* ── History panel ──────────────────────────────────────── */
+    .history-item {
+      display: flex; align-items: center;
+      padding: 10px 16px; cursor: pointer;
+      border-bottom: 1px solid rgba(255,255,255,0.04);
+      transition: background .15s;
+    }
+    .history-item:last-child { border-bottom: none; }
+    .history-item:hover { background: rgba(255,255,255,0.03); }
+    .history-item.active { background: rgba(220,38,38,0.06); }
+  </style>
+</head>
+<body class="text-gray-400 min-h-screen">
+
+  <!-- ── Header ──────────────────────────────────────────────────────── -->
+  <header class="glass sticky top-0 z-50 px-6 py-3 flex items-center justify-between">
+    <div class="flex items-center gap-3">
+      <svg viewBox="0 0 36 36" fill="none" xmlns="http://www.w3.org/2000/svg" class="w-8 h-8 flex-shrink-0">
+        <path d="M18 3L5 8v10c0 8 5.8 15.3 13 17 7.2-1.7 13-9 13-17V8L18 3z"
+              fill="rgba(220,38,38,0.18)" stroke="#ef4444" stroke-width="1.5"/>
+        <path d="M12.5 18l3.5 3.5 7.5-7.5"
+              stroke="#fca5a5" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/>
+      </svg>
+      <div>
+        <span class="text-white font-bold text-base tracking-tight">VulnHawk</span>
+        <span class="text-gray-600 text-xs ml-2 hidden sm:inline">AI Vulnerability Scanner</span>
+      </div>
+    </div>
+    <div class="flex items-center gap-4">
+      <button onclick="toggleHistory()"
+              class="flex items-center gap-1.5 px-3 py-1.5 rounded-lg text-xs text-gray-500 hover:text-gray-200 transition"
+              style="background:rgba(255,255,255,0.04);border:1px solid rgba(255,255,255,0.07)">
+        <svg xmlns="http://www.w3.org/2000/svg" class="w-3.5 h-3.5" fill="none" viewBox="0 0 24 24" stroke="currentColor" stroke-width="2">
+          <path stroke-linecap="round" stroke-linejoin="round" d="M12 8v4l3 3m6-3a9 9 0 11-18 0 9 9 0 0118 0z"/>
+        </svg>
+        History
+      </button>
+      <div id="health-badge" class="flex items-center gap-2">
+        <span class="spinner"></span>
+        <span class="text-xs text-gray-600">Connecting…</span>
+      </div>
+    </div>
+  </header>
+
+  <!-- ── Main ────────────────────────────────────────────────────────── -->
+  <main class="max-w-4xl mx-auto px-4 pt-12 pb-10 space-y-5">
+
+    <!-- Hero -->
+    <div class="text-center mb-10">
+      <h2 class="text-3xl font-bold text-white mb-3 tracking-tight">
+        Vulnerability Scanner
+      </h2>
+      <p class="text-sm text-gray-600 max-w-sm mx-auto leading-relaxed">
+        Scan Maven &amp; Gradle projects against the OSV database.<br/>Get severity ratings and safe upgrade paths instantly.
+      </p>
+    </div>
+
+    <!-- Scan Card -->
+    <div class="glass rounded-2xl p-6 space-y-5">
+
+      <!-- Mode toggle -->
+      <div class="flex items-center justify-between">
+        <span class="text-xs text-gray-600 font-semibold uppercase tracking-widest">Scan mode</span>
+        <div class="flex gap-1 p-1 rounded-xl" style="background:rgba(9,9,15,0.6);border:1px solid rgba(255,255,255,0.06)">
+          <button id="mode-url" onclick="setMode('url')"
+                  class="scan-mode-btn active px-4 py-1.5 rounded-lg text-xs font-medium border border-transparent">
+            GitHub URL
+          </button>
+          <button id="mode-dep" onclick="setMode('dep')"
+                  class="scan-mode-btn px-4 py-1.5 rounded-lg text-xs font-medium border border-transparent">
+            Dep List
+          </button>
+        </div>
+      </div>
+
+      <!-- URL input -->
+      <div id="input-url">
+        <label class="block text-xs text-gray-600 font-medium mb-2">Repository URL</label>
+        <input id="github-url" type="text"
+               placeholder="https://github.com/owner/repo"
+               class="w-full rounded-xl px-4 py-3 text-sm" />
+      </div>
+
+      <!-- Dep list input -->
+      <div id="input-dep" class="hidden">
+        <label class="block text-xs text-gray-600 font-medium mb-2">Maven / Gradle coordinates — one per line</label>
+        <textarea id="dep-list" rows="6"
+                  placeholder="com.fasterxml.jackson.core:jackson-databind:2.13.0&#10;org.apache.logging.log4j:log4j-core:2.14.1&#10;org.springframework:spring-core:5.3.20"
+                  class="w-full rounded-xl px-4 py-3 text-sm resize-none leading-relaxed"
+                  style="font-family:'JetBrains Mono',monospace;font-size:.78rem"></textarea>
+      </div>
+
+      <!-- Action row -->
+      <div class="flex items-center gap-4">
+        <button onclick="runScan()" id="scan-btn"
+                class="btn-scan px-7 py-2.5 rounded-xl text-sm text-white font-semibold tracking-wide">
+          Run Scan
+        </button>
+        <span id="scan-hint" class="text-xs text-gray-600">Full repo scans take 3–8 min</span>
+      </div>
+    </div>
+
+    <!-- Loading -->
+    <div id="scan-loading" class="hidden glass rounded-2xl p-10 fade-in">
+      <div class="flex flex-col items-center mb-10">
+        <div class="relative mb-5">
+          <div class="spinner-lg"></div>
+          <div class="absolute inset-0 rounded-full" style="box-shadow:0 0 40px rgba(220,38,38,0.15)"></div>
+        </div>
+        <p class="text-white font-semibold text-base mb-1">Scanning…</p>
+        <div id="elapsed-timer" class="text-gray-600 text-xs font-mono mt-1 tabular-nums" style="font-family:'JetBrains Mono',monospace"></div>
+      </div>
+      <div class="max-w-xs mx-auto">
+        <div class="step"><span id="s1" class="step-dot step-active"></span><span class="step-label active">Detecting build system</span></div>
+        <div class="step"><span id="s2" class="step-dot step-wait"></span><span class="step-label waiting">Extracting dependencies</span></div>
+        <div class="step"><span id="s3" class="step-dot step-wait"></span><span class="step-label waiting">Checking OSV database</span></div>
+        <div class="step"><span id="s4" class="step-dot step-wait"></span><span class="step-label waiting">Looking up safe versions</span></div>
+        <div class="step"><span id="s5" class="step-dot step-wait"></span><span class="step-label waiting">Building report</span></div>
+      </div>
+    </div>
+
+    <!-- Result card -->
+    <div id="result-card" class="hidden glass rounded-2xl fade-in overflow-hidden">
+
+      <!-- Summary bar -->
+      <div id="summary-bar"
+           class="flex items-center gap-3 px-6 py-4 flex-wrap gap-y-2"
+           style="background:rgba(220,38,38,0.05);border-bottom:1px solid rgba(220,38,38,0.09)">
+      </div>
+
+      <!-- Tab toggle + Section nav + actions -->
+      <div class="px-6 py-3 flex items-center gap-3"
+           style="border-bottom:1px solid rgba(255,255,255,0.05)">
+
+        <!-- Tab toggle -->
+        <div class="flex gap-1 p-0.5 rounded-xl flex-shrink-0"
+             style="background:rgba(9,9,15,0.6);border:1px solid rgba(255,255,255,0.06)">
+          <button id="tab-report" onclick="switchTab('report')"
+                  class="tab-btn active px-3 py-1 rounded-lg text-xs">Report</button>
+          <button id="tab-deps" onclick="switchTab('deps')"
+                  class="tab-btn px-3 py-1 rounded-lg text-xs">Dependencies</button>
+        </div>
+
+        <!-- Section nav (hidden on deps tab) -->
+        <div id="section-nav" class="section-nav flex-1 min-w-0"></div>
+
+        <!-- Actions -->
+        <div class="flex gap-2 flex-shrink-0">
+          <button onclick="downloadReport()"
+                  class="flex items-center gap-1.5 px-3 py-1.5 rounded-lg text-xs text-gray-500 hover:text-gray-200 transition"
+                  style="background:rgba(255,255,255,0.04);border:1px solid rgba(255,255,255,0.07)">
+            <svg xmlns="http://www.w3.org/2000/svg" class="w-3.5 h-3.5" fill="none" viewBox="0 0 24 24" stroke="currentColor" stroke-width="2">
+              <path stroke-linecap="round" stroke-linejoin="round" d="M4 16v1a3 3 0 003 3h10a3 3 0 003-3v-1m-4-4l-4 4m0 0l-4-4m4 4V4"/>
+            </svg>
+            Download
+          </button>
+          <button onclick="copyReport()"
+                  class="flex items-center gap-1.5 px-3 py-1.5 rounded-lg text-xs text-gray-500 hover:text-gray-200 transition"
+                  style="background:rgba(255,255,255,0.04);border:1px solid rgba(255,255,255,0.07)">
+            <svg xmlns="http://www.w3.org/2000/svg" class="w-3.5 h-3.5" fill="none" viewBox="0 0 24 24" stroke="currentColor" stroke-width="2">
+              <path stroke-linecap="round" stroke-linejoin="round" d="M8 16H6a2 2 0 01-2-2V6a2 2 0 012-2h8a2 2 0 012 2v2m-6 12h8a2 2 0 002-2v-8a2 2 0 00-2-2h-8a2 2 0 00-2 2v8a2 2 0 002 2z"/>
+            </svg>
+            Copy
+          </button>
+        </div>
+      </div>
+
+      <!-- Body panels -->
+      <div class="p-6 pt-5">
+        <div id="report-panel">
+          <div id="report-body" class="ai-content text-sm leading-relaxed"></div>
+        </div>
+        <div id="deps-panel" class="hidden"></div>
+      </div>
+    </div>
+
+    <!-- History panel -->
+    <div id="history-section" class="hidden glass rounded-2xl overflow-hidden fade-in">
+      <div class="flex items-center justify-between px-5 py-3"
+           style="border-bottom:1px solid rgba(255,255,255,0.05)">
+        <span class="text-xs font-semibold text-gray-500 uppercase tracking-widest">Scan History</span>
+        <button onclick="closeHistory()"
+                class="text-gray-600 hover:text-gray-300 transition p-1 rounded">
+          <svg xmlns="http://www.w3.org/2000/svg" class="w-4 h-4" fill="none" viewBox="0 0 24 24" stroke="currentColor" stroke-width="2">
+            <path stroke-linecap="round" stroke-linejoin="round" d="M6 18L18 6M6 6l12 12"/>
+          </svg>
+        </button>
+      </div>
+      <div id="history-list" class="max-h-96 overflow-y-auto divide-y divide-white/5">
+        <!-- populated by JS -->
+      </div>
+    </div>
+
+  </main>
+
+  <footer class="text-center text-xs py-8" style="color:#1f2937">
+    VulnHawk &nbsp;·&nbsp; Authorized security assessment only &nbsp;·&nbsp; OSV + CrewAI
+  </footer>
+
+  <script src="/static/app.js"></script>
+</body>
+</html>
